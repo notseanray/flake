@@ -13,4 +13,5 @@ tokio = { version = "1.28.2", features = ["macros"] }
 termion = "2.0.1"
 futures-util = "0.3.28"
 docker-compose-types = "0.5.1"
+git2 = "0.17.2"
 # tfschema_bindgen = "0.1.5"
