@@ -1,18 +1,18 @@
-use bollard::exec::{CreateExecOptions, StartExecResults};
 use git2::build::{CheckoutBuilder, RepoBuilder};
 use git2::{Cred, FetchOptions, Progress, RemoteCallbacks};
 use serde::{Deserialize, Serialize};
+use tokio::process::Command;
+use tokio_process_stream::ProcessLineStream;
 use std::env::home_dir;
-
 use bollard::container::{
     AttachContainerOptions, AttachContainerResults, Config, RemoveContainerOptions,
 };
-use bollard::image::CreateImageOptions;
+use bollard::image::{CreateImageOptions, BuildImageOptions};
 use bollard::Docker;
 use futures_util::{StreamExt, TryStreamExt};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, HashMap};
-use std::fs::{create_dir_all, read_dir, read_to_string, ReadDir};
+use std::collections::BTreeMap;
+use std::fs::{create_dir_all, read_to_string};
 use std::io::{stdout, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -38,7 +38,6 @@ struct Repo {
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct MainConfig {
-    clone_ordering: bool,
     repositories: Vec<Repo>,
     container_ordering: bool,
     containers: Vec<Container>,
@@ -155,7 +154,7 @@ fn clone_repository(url: &str, path: &str) -> Result<(), git2::Error> {
     Ok(())
 }
 
-enum ContainerSetupType {
+enum SetupFile{
     DockerCompose,
     DockerFile,
     Shell
@@ -163,16 +162,10 @@ enum ContainerSetupType {
 
 struct ContainerSetupJob {
     pub name: String,
-    pub job_type: ContainerSetupType,
+    pub job_type: SetupFile,
     pub shell: bool,
     // show output to stdout
     pub output: bool,
-}
-
-impl ContainerSetupJob {
-    pub fn execute(self) {
-
-    }
 }
 
 #[tokio::main]
@@ -194,26 +187,119 @@ async fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
         clone_repository(&repository.url, &dir)?;
     }
 
-    let container_setup_queue = Vec::with_capacity(main_config.containers.len());
+    let mut container_setup_queue = Vec::with_capacity(main_config.containers.len());
 
     for container in main_config.containers {
         let entry = PathBuf::from(format!("configs/{}", container.name));
         if entry.is_dir() {
             let compose = entry.join("docker-compose.yml").exists();
             let docker_file = entry.join("Dockerfile").exists();
-            let shell = entry.join(".shell").exists();
+            let shell = entry.join(format!("{}.shell", container.name)).exists();
             if compose && docker_file {
                 panic!("cannot have both docker compose and a docker file");
             }
-            let job_type = match 
-            ContainerSetupJob {
+            println!("{:?}", entry);
+            let job_type = match (compose, docker_file, shell) {
+                (true, false, false) => SetupFile::DockerCompose,
+                (false, true, false) => SetupFile::DockerFile,
+                (false, false, true) => SetupFile::Shell,
+                _ => panic!("cannot have multiple setup types"),
+            };
+            container_setup_queue.push(ContainerSetupJob {
                 name: container.name,
                 job_type,
                 shell: true,
                 output: true,
-            }
+            });
             continue;
         }
+    }
+    let docker = Docker::connect_with_socket_defaults()?;
+    // par iter
+    // TODO async par iter
+    if !main_config.container_ordering {
+        unimplemented!();
+        for container in container_setup_queue {
+            // tokio_rayon::spawn(async || {
+            //     match container.job_type {
+            //         SetupFile::Shell => {
+            //             // unimplemented!();
+            //             let content = read_to_string(format!("configs/{}/{}.shell", container.name, container.name)).unwrap();
+            //             for line in content.lines() {
+            //                 let mut line: Vec<&str> = line.split_whitespace().collect();
+            //                 if line.is_empty() {
+            //                     continue;
+            //                 }
+            //                 let mut compose_cmd = Command::new(line.remove(0));
+            //                 compose_cmd.args(line);
+            //             }
+            //             unimplemented!();
+            //         },
+            //         SetupFile::DockerFile => {
+            //             let build_options = BuildImageOptions {
+            //                 dockerfile: format!("configs/{}/Dockerfile", container.name),
+            //                 ..BuildImageOptions::default()
+            //             };
+            //             let mut build_options = docker.build_image(build_options, None, None);
+            //             while let Some(msg) = build_options.next().await {
+            //                 println!("[{}] {:?}", container.name, msg);
+            //             }
+            //         },
+            //         SetupFile::DockerCompose => {
+            //             let mut compose_cmd = Command::new("docker-compose");
+            //             compose_cmd.args(["-f", format!("configs/{}/docker-compose.yml", container.name).as_str(), "up", "-d"]);
+            //             let mut process = ProcessLineStream::try_from(compose_cmd).unwrap();
+            //             while let Some(v) = process.next().await {
+            //                 println!("[{}] {}", container.name, v);
+            //             }
+            //
+            //         },
+            //     };
+            // }).await;
+        }
+    } else {
+        // non par
+        for container in container_setup_queue {
+            println!("{}", container.name);
+            match container.job_type {
+                SetupFile::Shell => {
+                    // TODO optimize this?
+                    let content = read_to_string(format!("configs/{}/{}.shell", container.name, container.name))?;
+                    println!("{content}");
+                    for line in content.lines() {
+                        let mut line: Vec<&str> = line.split_whitespace().collect();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        let mut cmd = Command::new(line.remove(0));
+                        cmd.args(line);
+                        let mut cmd = ProcessLineStream::try_from(cmd)?;
+                        while let Some(v) = cmd.next().await {
+                            println!("[{}] {}", container.name, v);
+                        }
+                    }
+                },
+                SetupFile::DockerFile => {
+                    let build_options = BuildImageOptions {
+                        dockerfile: format!("configs/{}/Dockerfile", container.name),
+                        ..BuildImageOptions::default()
+                    };
+                    let mut build_options = docker.build_image(build_options, None, None);
+                    while let Some(msg) = build_options.next().await {
+                        println!("[{}] {:?}", container.name, msg);
+                    }
+                },
+                SetupFile::DockerCompose => {
+                    let mut compose_cmd = Command::new("docker-compose");
+                    compose_cmd.args(["-f", format!("configs/{}/docker-compose.yml", container.name).as_str(), "up", "-d"]);
+                    let mut process = ProcessLineStream::try_from(compose_cmd)?;
+                    while let Some(v) = process.next().await {
+                        println!("[{}] {}", container.name, v);
+                    }
+
+                },
+            };
+        };
     }
     // just a file -> raw shell
     // dockerfile try to parse as yaml, if fail then docker file
@@ -235,7 +321,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
     //
     // }
     panic!("test");
-    let docker = Docker::connect_with_socket_defaults().unwrap();
 
     docker
         .create_image(
