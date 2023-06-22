@@ -2,3 +2,5 @@
 .DS_Store
 /data
 /configs
+openapi.json
+/localstack

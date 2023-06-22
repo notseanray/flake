@@ -1,9 +1,11 @@
+use bollard::network::CreateNetworkOptions;
 use git2::build::{CheckoutBuilder, RepoBuilder};
 use git2::{Cred, FetchOptions, Progress, RemoteCallbacks};
 use serde::{Deserialize, Serialize};
 use tokio::process::Command;
 use tokio_process_stream::ProcessLineStream;
 use std::env::home_dir;
+use std::thread;
 use bollard::container::{
     AttachContainerOptions, AttachContainerResults, Config, RemoveContainerOptions,
 };
@@ -23,6 +25,8 @@ use termion::raw::IntoRawMode;
 use tokio::io::AsyncWriteExt;
 use tokio::task::spawn;
 use tokio::time::sleep;
+use bollard::network::ConnectNetworkOptions;
+use bollard::models::EndpointSettings;
 
 struct LoggingSystem {
     source_container: String,
@@ -37,17 +41,34 @@ struct Repo {
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
+struct ContainerNetwork {
+    name: String,
+    containers: Vec<String>,
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct MainConfig {
     repositories: Vec<Repo>,
     container_ordering: bool,
     containers: Vec<Container>,
     dashboard_port: Option<u16>,
+    // Vec<name> of containers in network
+    container_network: Option<ContainerNetwork>,
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
 struct Container {
     name: String,
+    enabled: Option<bool>,
     env: Option<BTreeMap<String, String>>,
+}
+
+struct ContainerSetupJob {
+    pub name: String,
+    pub job_type: SetupFile,
+    pub shell: bool,
+    // show output to stdout
+    pub output: bool,
 }
 
 struct State {
@@ -75,7 +96,7 @@ fn print_clone_status(state: &mut State) {
         );
     } else {
         print!(
-            "{:3}% ({:4} kb, {:5}/{:5}) idx {:3}% ({:5}/{:5})\r",
+            "\r{:3}% ({:4} kb, {:5}/{:5}) idx {:3}% ({:5}/{:5})",
             network_pct,
             kbytes,
             stats.received_objects(),
@@ -154,19 +175,18 @@ fn clone_repository(url: &str, path: &str) -> Result<(), git2::Error> {
     Ok(())
 }
 
+#[derive(Debug)]
 enum SetupFile{
     DockerCompose,
     DockerFile,
     Shell
 }
 
-struct ContainerSetupJob {
-    pub name: String,
-    pub job_type: SetupFile,
-    pub shell: bool,
-    // show output to stdout
-    pub output: bool,
-}
+
+// TODO check if containers are already running for custom configs, if so prompt to kill
+// CLAP arg parser and config helper (generate default config)
+// separate docker files for this CI in repo
+// logging crate
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
@@ -190,6 +210,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
     let mut container_setup_queue = Vec::with_capacity(main_config.containers.len());
 
     for container in main_config.containers {
+        if !container.enabled.unwrap_or(true) {
+            continue;
+        }
         let entry = PathBuf::from(format!("configs/{}", container.name));
         if entry.is_dir() {
             let compose = entry.join("docker-compose.yml").exists();
@@ -199,6 +222,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
                 panic!("cannot have both docker compose and a docker file");
             }
             println!("{:?}", entry);
+            // TODO if multiple types, always run shell last
             let job_type = match (compose, docker_file, shell) {
                 (true, false, false) => SetupFile::DockerCompose,
                 (false, true, false) => SetupFile::DockerFile,
@@ -215,6 +239,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
         }
     }
     let docker = Docker::connect_with_socket_defaults()?;
+    if let Some(v) = main_config.container_network {
+        let config = CreateNetworkOptions {
+            name: v.name,
+            ..Default::default()
+        };
+        docker.create_network(config).await;
+    }
+
     // par iter
     // TODO async par iter
     if !main_config.container_ordering {
@@ -260,20 +292,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
     } else {
         // non par
         for container in container_setup_queue {
-            println!("{}", container.name);
             match container.job_type {
                 SetupFile::Shell => {
                     // TODO optimize this?
                     let content = read_to_string(format!("configs/{}/{}.shell", container.name, container.name))?;
-                    println!("{content}");
                     for line in content.lines() {
+                        if line.trim().starts_with('#') {
+                            continue;
+                        }
                         let mut line: Vec<&str> = line.split_whitespace().collect();
                         if line.is_empty() {
                             continue;
                         }
                         let mut cmd = Command::new(line.remove(0));
+                        let process_dir = PathBuf::from(format!("./data/{}", container.name));
+                        cmd.current_dir(process_dir);
+                        // if process_dir.exists() {
+                        //     println!("exists");
+                        // }
                         cmd.args(line);
-                        let mut cmd = ProcessLineStream::try_from(cmd)?;
+                        let mut cmd = ProcessLineStream::try_from(cmd).expect("2");
                         while let Some(v) = cmd.next().await {
                             println!("[{}] {}", container.name, v);
                         }
@@ -292,13 +330,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
                 SetupFile::DockerCompose => {
                     let mut compose_cmd = Command::new("docker-compose");
                     compose_cmd.args(["-f", format!("configs/{}/docker-compose.yml", container.name).as_str(), "up", "-d"]);
-                    let mut process = ProcessLineStream::try_from(compose_cmd)?;
+                    let mut process = ProcessLineStream::try_from(compose_cmd).expect("`");
                     while let Some(v) = process.next().await {
                         println!("[{}] {}", container.name, v);
                     }
 
                 },
             };
+            let config = ConnectNetworkOptions {
+                container: container.name,
+                endpoint_config: EndpointSettings::default(),
+            };
+
+            let _ = docker.connect_network("my_network_name", config).await;
         };
     }
     // just a file -> raw shell
@@ -320,34 +364,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
     //     }
     //
     // }
-    panic!("test");
 
-    docker
-        .create_image(
-            Some(CreateImageOptions {
-                from_image: "",
-                ..Default::default()
-            }),
-            None,
-            None,
-        )
-        .try_collect::<Vec<_>>()
-        .await?;
-    let alpine_config = Config {
-        image: Some(""),
-        tty: Some(true),
-        attach_stdin: Some(true),
-        attach_stdout: Some(true),
-        attach_stderr: Some(true),
-        open_stdin: Some(true),
-        ..Default::default()
-    };
-    let id = docker
-        .create_container::<&str, &str>(None, alpine_config)
-        .await?
-        .id;
-
-    docker.start_container::<String>(&id, None).await?;
+    // docker
+    //     .create_image(
+    //         Some(CreateImageOptions {
+    //             from_image: "",
+    //             ..Default::default()
+    //         }),
+    //         None,
+    //         None,
+    //     )
+    //     .try_collect::<Vec<_>>()
+    //     .await?;
+    // let alpine_config = Config {
+    //     image: Some(""),
+    //     tty: Some(true),
+    //     attach_stdin: Some(true),
+    //     attach_stdout: Some(true),
+    //     attach_stderr: Some(true),
+    //     open_stdin: Some(true),
+    //     ..Default::default()
+    // };
+    // let id = docker
+    //     .create_container::<&str, &str>(None, alpine_config)
+    //     .await?
+    //     .id;
+    //
+    // docker.start_container::<String>(&id, None).await?;
     // for cmd in setup {
     // non interactive
     //     let exec = docker
@@ -371,55 +414,57 @@ async fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
     //     }
     // }
     //
-    #[cfg(not(windows))]
-    if false {
-        let AttachContainerResults {
-            mut output,
-            mut input,
-        } = docker
-            .attach_container(
-                &id,
-                Some(AttachContainerOptions::<String> {
-                    stdout: Some(true),
-                    stderr: Some(true),
-                    stdin: Some(true),
-                    stream: Some(true),
-                    ..Default::default()
-                }),
-            )
-            .await?;
-
-        // pipe stdin into the docker attach stream input
-        spawn(async move {
-            let mut stdin = async_stdin().bytes();
-            loop {
-                if let Some(Ok(byte)) = stdin.next() {
-                    input.write(&[byte]).await.ok();
-                } else {
-                    sleep(Duration::from_nanos(10)).await;
-                }
-            }
-        });
-
-        // set stdout in raw mode so we can do tty stuff
-        let stdout = stdout();
-        let mut stdout = stdout.lock().into_raw_mode()?;
-
-        // pipe docker attach output into stdout
-        while let Some(Ok(output)) = output.next().await {
-            stdout.write_all(output.into_bytes().as_ref())?;
-            stdout.flush()?;
-        }
-    }
-    sleep(Duration::from_secs(30));
-    docker
-        .remove_container(
-            &id,
-            Some(RemoveContainerOptions {
-                force: true,
-                ..Default::default()
-            }),
-        )
-        .await?;
+    // #[cfg(not(windows))]
+    // if false {
+    //     let AttachContainerResults {
+    //         mut output,
+    //         mut input,
+    //     } = docker
+    //         .attach_container(
+    //             &id,
+    //             Some(AttachContainerOptions::<String> {
+    //                 stdout: Some(true),
+    //                 stderr: Some(true),
+    //                 stdin: Some(true),
+    //                 stream: Some(true),
+    //                 ..Default::default()
+    //             }),
+    //         )
+    //         .await?;
+    //
+    //     // pipe stdin into the docker attach stream input
+    //     spawn(async move {
+    //         let mut stdin = async_stdin().bytes();
+    //         loop {
+    //             if let Some(Ok(byte)) = stdin.next() {
+    //                 input.write(&[byte]).await.ok();
+    //             } else {
+    //                 sleep(Duration::from_nanos(10)).await;
+    //             }
+    //         }
+    //     });
+    //
+    //     // set stdout in raw mode so we can do tty stuff
+    //     let stdout = stdout();
+    //     let mut stdout = stdout.lock().into_raw_mode()?;
+    //
+    //     // pipe docker attach output into stdout
+    //     while let Some(Ok(output)) = output.next().await {
+    //         stdout.write_all(output.into_bytes().as_ref())?;
+    //         stdout.flush()?;
+    //     }
+    // }
+    // sleep(Duration::from_secs(30));
+    // docker
+    //     .remove_container(
+    //         &id,
+    //         Some(RemoveContainerOptions {
+    //             force: true,
+    //             ..Default::default()
+    //         }),
+    //     )
+    //     .await?;
+    println!("Done");
+    thread::sleep(Duration::MAX);
     Ok(())
 }
