@@ -7,6 +7,7 @@ use futures_util::{StreamExt, TryStreamExt};
 use git2::build::{CheckoutBuilder, RepoBuilder};
 use git2::{Cred, FetchOptions, Progress, RemoteCallbacks};
 use serde::{Deserialize, Serialize};
+use std::arch::asm;
 use std::cell::RefCell;
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
@@ -438,6 +439,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
         };
         // let _ = docker.create_network(config).await;
     }
+    // this is the turbo based thread scheduler, don't ask how it works because i don't remember
+    // i think i wrote it down on a sticky note
+    //
+    // first, iterate through all the containers
+    // if they don't have deps then just stick them in the front
+    // if they do have deps but they're already in the list to execute then insert at the index of
+    // the last dep/latest index
+    // otherwise insert at the back
+    // go through a pass to try and find if any have circular deps
+    // maintain a list of jobs that are complete (Arc<RwLock<Vec<String>>>)
+    // if the job has no dep, execute it in parallel
+    // if the job has deps, constantly poll the list to see if all deps are complete
+    // if they are execute them
     if !main_config.container_ordering {
         let mut scheduled: Vec<Container> = Vec::with_capacity(main_config.containers.len());
         for container in &main_config.containers {
@@ -466,6 +480,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
             }
             scheduled.insert(0, container.clone());
         }
+        // detect any circular deps
         for container in &main_config.containers {
             for depend in &container.depends {
                 if depend.contains(&container.name) {
@@ -490,7 +505,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
                         .iter()
                         .map(|x| finished_jobs.read().unwrap().contains(x))
                         .all(|x| x)
-                    {}
+                    {
+                        // actually the most brain dead thing ever, force the compiler to not
+                        // create a path so it actually waits for deps to finish
+                        //
+                        // "sometimes my genius is almost frightening"
+                        unsafe { asm!("nop"); }
+                    }
                 }
                 j.execute_threaded(docker.clone(), main_config)
                     .await
