@@ -1,32 +1,33 @@
+use bollard::image::{BuildImageOptions, CreateImageOptions};
+use bollard::models::EndpointSettings;
+use bollard::network::ConnectNetworkOptions;
 use bollard::network::CreateNetworkOptions;
+use bollard::Docker;
+use futures_util::{StreamExt, TryStreamExt};
 use git2::build::{CheckoutBuilder, RepoBuilder};
 use git2::{Cred, FetchOptions, Progress, RemoteCallbacks};
 use serde::{Deserialize, Serialize};
-use tokio::process::Command;
-use tokio_process_stream::ProcessLineStream;
-use std::env::home_dir;
-use std::thread;
-use bollard::container::{
-    AttachContainerOptions, AttachContainerResults, Config, RemoveContainerOptions,
-};
-use bollard::image::{CreateImageOptions, BuildImageOptions};
-use bollard::Docker;
-use futures_util::{StreamExt, TryStreamExt};
 use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::collections::BTreeMap;
+use std::env::home_dir;
+use std::error::Error;
 use std::fs::{create_dir_all, read_to_string};
-use std::io::{stdout, Read, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::{Arc, RwLock};
+use std::thread;
 use std::time::Duration;
 #[cfg(not(windows))]
 use termion::async_stdin;
 #[cfg(not(windows))]
 use termion::raw::IntoRawMode;
 use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
 use tokio::task::spawn;
 use tokio::time::sleep;
-use bollard::network::ConnectNetworkOptions;
-use bollard::models::EndpointSettings;
+use tokio_process_stream::ProcessLineStream;
 
 struct LoggingSystem {
     source_container: String,
@@ -54,21 +55,63 @@ struct MainConfig {
     dashboard_port: Option<u16>,
     // Vec<name> of containers in network
     container_network: Option<ContainerNetwork>,
+    worker_containers: Option<Vec<Container>>,
 }
 
 #[derive(Debug, PartialEq, Serialize, Deserialize)]
+struct WorkerContainer {
+    container: Container,
+    // look at data directory
+    data: Option<bool>,
+}
+
+#[derive(Debug, PartialEq, Serialize, Deserialize, Clone)]
 struct Container {
     name: String,
     enabled: Option<bool>,
     env: Option<BTreeMap<String, String>>,
+    async_execution: Option<bool>,
+    output: bool,
+    // two are mutually exclusive
+    // fire after container
+    depends: Option<Vec<String>>,
+}
+
+impl TryFrom<Container> for ContainerSetupJob {
+    type Error = ();
+    fn try_from(container: Container) -> Result<Self, Self::Error> {
+        let entry = PathBuf::from(format!("configs/{}", container.name));
+        if entry.is_dir() {
+            let compose = entry.join("docker-compose.yml").exists();
+            let docker_file = entry.join("Dockerfile").exists();
+            let shell = entry.join(format!("{}.shell", container.name)).exists();
+            if compose && docker_file {
+                panic!("cannot have both docker compose and a docker file");
+            }
+            // TODO if multiple types, always run shell last
+            let job_type = match (compose, docker_file, shell) {
+                (true, false, false) => SetupFile::DockerCompose,
+                (false, true, false) => SetupFile::DockerFile,
+                (false, false, true) => SetupFile::Shell,
+                _ => return Err(()),
+            };
+            return Ok(ContainerSetupJob {
+                name: container.name.clone(),
+                job_type,
+                shell_hook: shell && (compose || docker_file),
+                output: container.output,
+            });
+        }
+        Err(())
+    }
 }
 
 struct ContainerSetupJob {
-    pub name: String,
-    pub job_type: SetupFile,
-    pub shell: bool,
+    name: String,
+    job_type: SetupFile,
+    shell_hook: bool,
     // show output to stdout
-    pub output: bool,
+    output: bool,
 }
 
 struct State {
@@ -79,34 +122,36 @@ struct State {
     newline: bool,
 }
 
-fn print_clone_status(state: &mut State) {
-    let stats = state.progress.as_ref().unwrap();
-    let network_pct = (100 * stats.received_objects()) / stats.total_objects();
-    let index_pct = (100 * stats.indexed_objects()) / stats.total_objects();
-    let kbytes = stats.received_bytes() / 1024;
-    if stats.received_objects() == stats.total_objects() {
-        if !state.newline {
-            println!();
-            state.newline = true;
+impl State {
+    pub fn print_clone_status(&mut self) {
+        let stats = self.progress.as_ref().unwrap();
+        let network_pct = (100 * stats.received_objects()) / stats.total_objects();
+        let index_pct = (100 * stats.indexed_objects()) / stats.total_objects();
+        let kbytes = stats.received_bytes() / 1024;
+        if stats.received_objects() == stats.total_objects() {
+            if !self.newline {
+                println!();
+                self.newline = true;
+            }
+            print!(
+                "Resolving deltas {}/{}\r",
+                stats.indexed_deltas(),
+                stats.total_deltas()
+            );
+        } else {
+            print!(
+                "\r{:3}% ({:4} kb, {:5}/{:5}) idx {:3}% ({:5}/{:5})",
+                network_pct,
+                kbytes,
+                stats.received_objects(),
+                stats.total_objects(),
+                index_pct,
+                stats.indexed_objects(),
+                stats.total_objects(),
+            )
         }
-        print!(
-            "Resolving deltas {}/{}\r",
-            stats.indexed_deltas(),
-            stats.total_deltas()
-        );
-    } else {
-        print!(
-            "\r{:3}% ({:4} kb, {:5}/{:5}) idx {:3}% ({:5}/{:5})",
-            network_pct,
-            kbytes,
-            stats.received_objects(),
-            stats.total_objects(),
-            index_pct,
-            stats.indexed_objects(),
-            stats.total_objects(),
-        )
+        std::io::stdout().flush().unwrap();
     }
-    std::io::stdout().flush().unwrap();
 }
 
 // TODO improve this
@@ -138,7 +183,7 @@ fn clone_repository(url: &str, path: &str) -> Result<(), git2::Error> {
     cb.transfer_progress(|stats| {
         let mut state = state.borrow_mut();
         state.progress = Some(stats.to_owned());
-        print_clone_status(&mut state);
+        state.print_clone_status();
         true
     });
     cb.credentials(
@@ -161,7 +206,7 @@ fn clone_repository(url: &str, path: &str) -> Result<(), git2::Error> {
         state.path = path.map(|p| p.to_path_buf());
         state.current = cur;
         state.total = total;
-        print_clone_status(&mut state);
+        state.print_clone_status();
     });
 
     let mut fo = FetchOptions::new();
@@ -176,17 +221,191 @@ fn clone_repository(url: &str, path: &str) -> Result<(), git2::Error> {
 }
 
 #[derive(Debug)]
-enum SetupFile{
+enum SetupFile {
     DockerCompose,
     DockerFile,
-    Shell
+    Shell,
 }
 
+impl ContainerSetupJob {
+    pub async fn execute(
+        &self,
+        docker: &Docker,
+        main_config: Arc<MainConfig>,
+    ) -> Result<(), Box<dyn Error>> {
+        match self.job_type {
+            SetupFile::Shell => {
+                // TODO optimize this?
+                let content = read_to_string(format!("configs/{}/{}.shell", self.name, self.name))?;
+                for line in content.lines().filter(|x| !x.starts_with('#')) {
+                    let mut line: Vec<&str> = line.split_whitespace().collect();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let mut cmd = Command::new(line.remove(0));
+                    let process_dir = PathBuf::from(format!("./data/{}", &self.name));
+                    cmd.current_dir(process_dir);
+                    // if process_dir.exists() {
+                    //     println!("exists");
+                    // }
+                    cmd.args(line);
+                    let mut cmd = ProcessLineStream::try_from(cmd).expect("2");
+
+                    let config = ConnectNetworkOptions {
+                        container: &self.name,
+                        endpoint_config: EndpointSettings::default(),
+                    };
+
+                    if let Some(v) = &main_config.container_network {
+                        let _ = docker.connect_network(&v.name, config).await;
+                    }
+
+                    while let Some(v) = cmd.next().await {
+                        println!("[{}] {}", self.name, v);
+                    }
+                }
+            }
+            SetupFile::DockerFile => {
+                let build_options = BuildImageOptions {
+                    dockerfile: format!("configs/{}/Dockerfile", self.name),
+                    networkmode: "bridge".to_string(),
+                    ..BuildImageOptions::default()
+                };
+                let mut build_options = docker.build_image(build_options, None, None);
+
+                let config = ConnectNetworkOptions {
+                    container: &self.name,
+                    endpoint_config: EndpointSettings::default(),
+                };
+
+                if let Some(v) = &main_config.container_network {
+                    let _ = docker.connect_network(&v.name, config).await;
+                }
+
+                while let Some(msg) = build_options.next().await {
+                    println!("[{}] {:?}", self.name, msg);
+                }
+            }
+            SetupFile::DockerCompose => {
+                let mut compose_cmd = Command::new("docker-compose");
+                compose_cmd.args([
+                    "-f",
+                    format!("configs/{}/docker-compose.yml", self.name).as_str(),
+                    "up",
+                    "-d",
+                ]);
+                let mut process = ProcessLineStream::try_from(compose_cmd).expect("`");
+
+                let config = ConnectNetworkOptions {
+                    container: &self.name,
+                    endpoint_config: EndpointSettings::default(),
+                };
+
+                if let Some(v) = &main_config.container_network {
+                    let _ = docker.connect_network(&v.name, config).await;
+                }
+
+                while let Some(v) = process.next().await {
+                    println!("[{}] {}", self.name, v);
+                }
+            }
+        };
+        Ok(())
+    }
+
+    pub async fn execute_threaded(
+        &self,
+        docker: Arc<Docker>,
+        main_config: Arc<MainConfig>,
+    ) -> Result<(), Box<dyn Error>> {
+        match self.job_type {
+            SetupFile::Shell => {
+                // TODO optimize this?
+                let content = read_to_string(format!("configs/{}/{}.shell", self.name, self.name))?;
+                for line in content.lines().filter(|x| !x.starts_with('#')) {
+                    let mut line: Vec<&str> = line.split_whitespace().collect();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    let mut cmd = Command::new(line.remove(0));
+                    let process_dir = PathBuf::from(format!("./data/{}", &self.name));
+                    cmd.current_dir(process_dir);
+                    // if process_dir.exists() {
+                    //     println!("exists");
+                    // }
+                    cmd.args(line);
+                    let mut cmd = ProcessLineStream::try_from(cmd).expect("2");
+
+                    let config = ConnectNetworkOptions {
+                        container: &self.name,
+                        endpoint_config: EndpointSettings::default(),
+                    };
+
+                    if let Some(v) = &main_config.container_network {
+                        let _ = docker.connect_network(&v.name, config).await;
+                    }
+
+                    while let Some(v) = cmd.next().await {
+                        println!("[{}] {}", self.name, v);
+                    }
+                }
+            }
+            SetupFile::DockerFile => {
+                let build_options = BuildImageOptions {
+                    dockerfile: format!("configs/{}/Dockerfile", self.name),
+                    networkmode: "bridge".to_string(),
+                    ..BuildImageOptions::default()
+                };
+                let mut build_options = docker.build_image(build_options, None, None);
+
+                let config = ConnectNetworkOptions {
+                    container: &self.name,
+                    endpoint_config: EndpointSettings::default(),
+                };
+
+                if let Some(v) = &main_config.container_network {
+                    let _ = docker.connect_network(&v.name, config).await;
+                }
+
+                while let Some(msg) = build_options.next().await {
+                    println!("[{}] {:?}", self.name, msg);
+                }
+            }
+            SetupFile::DockerCompose => {
+                let mut compose_cmd = Command::new("docker-compose");
+                compose_cmd.args([
+                    "-f",
+                    format!("configs/{}/docker-compose.yml", self.name).as_str(),
+                    "up",
+                    "-d",
+                ]);
+                let mut process = ProcessLineStream::try_from(compose_cmd).expect("`");
+
+                let config = ConnectNetworkOptions {
+                    container: &self.name,
+                    endpoint_config: EndpointSettings::default(),
+                };
+
+                if let Some(v) = &main_config.container_network {
+                    let _ = docker.connect_network(&v.name, config).await;
+                }
+
+                while let Some(v) = process.next().await {
+                    println!("[{}] {}", self.name, v);
+                }
+            }
+        };
+        Ok(())
+    }
+}
 
 // TODO check if containers are already running for custom configs, if so prompt to kill
 // CLAP arg parser and config helper (generate default config)
 // separate docker files for this CI in repo
 // logging crate
+// worker container to perform some basic functions like set things up
+// datalake
+// datalake
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
@@ -195,11 +414,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
         println!("no config folder exists, exiting");
         std::process::exit(1);
     }
-    let main_config: MainConfig = serde_yaml::from_str(&read_to_string("configs/main.yml")?)?;
+    let config = read_to_string("configs/main.yml")?;
+    let main_config: Arc<MainConfig> = Arc::new(serde_yaml::from_str(&config)?);
 
     create_dir_all("data")?;
 
-    for repository in main_config.repositories {
+    for repository in &main_config.repositories {
         let dir = format!("./data/{}", repository.name);
         if PathBuf::from(&dir).exists() {
             continue;
@@ -207,143 +427,88 @@ async fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
         clone_repository(&repository.url, &dir)?;
     }
 
-    let mut container_setup_queue = Vec::with_capacity(main_config.containers.len());
-
-    for container in main_config.containers {
-        if !container.enabled.unwrap_or(true) {
-            continue;
-        }
-        let entry = PathBuf::from(format!("configs/{}", container.name));
-        if entry.is_dir() {
-            let compose = entry.join("docker-compose.yml").exists();
-            let docker_file = entry.join("Dockerfile").exists();
-            let shell = entry.join(format!("{}.shell", container.name)).exists();
-            if compose && docker_file {
-                panic!("cannot have both docker compose and a docker file");
-            }
-            println!("{:?}", entry);
-            // TODO if multiple types, always run shell last
-            let job_type = match (compose, docker_file, shell) {
-                (true, false, false) => SetupFile::DockerCompose,
-                (false, true, false) => SetupFile::DockerFile,
-                (false, false, true) => SetupFile::Shell,
-                _ => panic!("cannot have multiple setup types"),
-            };
-            container_setup_queue.push(ContainerSetupJob {
-                name: container.name,
-                job_type,
-                shell: true,
-                output: true,
-            });
-            continue;
-        }
-    }
     let docker = Docker::connect_with_socket_defaults()?;
-    if let Some(v) = main_config.container_network {
+    if let Some(v) = &main_config.container_network {
         let config = CreateNetworkOptions {
-            name: v.name,
+            name: v.name.clone(),
+            attachable: true,
+            ingress: true,
+            driver: "overlay".to_string(),
             ..Default::default()
         };
-        docker.create_network(config).await;
+        // let _ = docker.create_network(config).await;
     }
-
-    // par iter
-    // TODO async par iter
     if !main_config.container_ordering {
-        unimplemented!();
-        for container in container_setup_queue {
-            // tokio_rayon::spawn(async || {
-            //     match container.job_type {
-            //         SetupFile::Shell => {
-            //             // unimplemented!();
-            //             let content = read_to_string(format!("configs/{}/{}.shell", container.name, container.name)).unwrap();
-            //             for line in content.lines() {
-            //                 let mut line: Vec<&str> = line.split_whitespace().collect();
-            //                 if line.is_empty() {
-            //                     continue;
-            //                 }
-            //                 let mut compose_cmd = Command::new(line.remove(0));
-            //                 compose_cmd.args(line);
-            //             }
-            //             unimplemented!();
-            //         },
-            //         SetupFile::DockerFile => {
-            //             let build_options = BuildImageOptions {
-            //                 dockerfile: format!("configs/{}/Dockerfile", container.name),
-            //                 ..BuildImageOptions::default()
-            //             };
-            //             let mut build_options = docker.build_image(build_options, None, None);
-            //             while let Some(msg) = build_options.next().await {
-            //                 println!("[{}] {:?}", container.name, msg);
-            //             }
-            //         },
-            //         SetupFile::DockerCompose => {
-            //             let mut compose_cmd = Command::new("docker-compose");
-            //             compose_cmd.args(["-f", format!("configs/{}/docker-compose.yml", container.name).as_str(), "up", "-d"]);
-            //             let mut process = ProcessLineStream::try_from(compose_cmd).unwrap();
-            //             while let Some(v) = process.next().await {
-            //                 println!("[{}] {}", container.name, v);
-            //             }
-            //
-            //         },
-            //     };
-            // }).await;
+        let mut scheduled: Vec<Container> = Vec::with_capacity(main_config.containers.len());
+        for container in &main_config.containers {
+            if let Some(deps) = &container.depends {
+                let mut fufilled_list: Vec<Option<usize>> = deps
+                    .iter()
+                    .map(|x| scheduled.iter().position(|p| &p.name == x))
+                    .collect();
+                fufilled_list.sort_unstable_by(|l, r| {
+                    if let (Some(l), Some(r)) = (l, r) {
+                        l.partial_cmp(r).unwrap()
+                    } else {
+                        Ordering::Less
+                    }
+                });
+                if !fufilled_list.contains(&None) {
+                    scheduled.push(container.clone());
+                    continue;
+                }
+                if let Some(Some(v)) = fufilled_list.last() {
+                    scheduled.insert(*v, container.clone());
+                    continue;
+                }
+                scheduled.push(container.clone());
+                continue;
+            }
+            scheduled.insert(0, container.clone());
         }
+        for container in &main_config.containers {
+            for depend in &container.depends {
+                if depend.contains(&container.name) {
+                    // exit herer
+                }
+            }
+        }
+        let docker = Arc::new(docker);
+        let container_setup_queue: Vec<(Container, ContainerSetupJob)> = scheduled
+            .iter()
+            .filter_map(|x| x.clone().try_into().ok().map(|v| (x.clone(), v)))
+            .collect();
+        let finished_jobs = Arc::new(RwLock::new(Vec::with_capacity(container_setup_queue.len())));
+        for (c, j) in container_setup_queue {
+            let main_config = main_config.clone();
+            let docker = docker.clone();
+            let finished_jobs = finished_jobs.clone();
+            tokio::spawn(async move {
+                // delay until all dependants are finished
+                if let Some(v) = c.depends {
+                    while !v
+                        .iter()
+                        .map(|x| finished_jobs.read().unwrap().contains(x))
+                        .all(|x| x)
+                    {}
+                }
+                j.execute_threaded(docker.clone(), main_config)
+                    .await
+                    .unwrap();
+                finished_jobs.write().unwrap().push(c.name.clone());
+            });
+        }
+        // }
     } else {
+        let container_setup_queue: Vec<ContainerSetupJob> = main_config
+            .containers
+            .iter()
+            .filter_map(|x| x.clone().try_into().ok())
+            .collect();
         // non par
-        for container in container_setup_queue {
-            match container.job_type {
-                SetupFile::Shell => {
-                    // TODO optimize this?
-                    let content = read_to_string(format!("configs/{}/{}.shell", container.name, container.name))?;
-                    for line in content.lines() {
-                        if line.trim().starts_with('#') {
-                            continue;
-                        }
-                        let mut line: Vec<&str> = line.split_whitespace().collect();
-                        if line.is_empty() {
-                            continue;
-                        }
-                        let mut cmd = Command::new(line.remove(0));
-                        let process_dir = PathBuf::from(format!("./data/{}", container.name));
-                        cmd.current_dir(process_dir);
-                        // if process_dir.exists() {
-                        //     println!("exists");
-                        // }
-                        cmd.args(line);
-                        let mut cmd = ProcessLineStream::try_from(cmd).expect("2");
-                        while let Some(v) = cmd.next().await {
-                            println!("[{}] {}", container.name, v);
-                        }
-                    }
-                },
-                SetupFile::DockerFile => {
-                    let build_options = BuildImageOptions {
-                        dockerfile: format!("configs/{}/Dockerfile", container.name),
-                        ..BuildImageOptions::default()
-                    };
-                    let mut build_options = docker.build_image(build_options, None, None);
-                    while let Some(msg) = build_options.next().await {
-                        println!("[{}] {:?}", container.name, msg);
-                    }
-                },
-                SetupFile::DockerCompose => {
-                    let mut compose_cmd = Command::new("docker-compose");
-                    compose_cmd.args(["-f", format!("configs/{}/docker-compose.yml", container.name).as_str(), "up", "-d"]);
-                    let mut process = ProcessLineStream::try_from(compose_cmd).expect("`");
-                    while let Some(v) = process.next().await {
-                        println!("[{}] {}", container.name, v);
-                    }
-
-                },
-            };
-            let config = ConnectNetworkOptions {
-                container: container.name,
-                endpoint_config: EndpointSettings::default(),
-            };
-
-            let _ = docker.connect_network("my_network_name", config).await;
-        };
+        for c in container_setup_queue {
+            c.execute(&docker, main_config.clone()).await?;
+        }
     }
     // just a file -> raw shell
     // dockerfile try to parse as yaml, if fail then docker file
