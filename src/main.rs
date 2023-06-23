@@ -501,6 +501,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
             tokio::spawn(async move {
                 // delay until all dependants are finished
                 if let Some(v) = c.depends {
+                    // prevent release mode from determining that the loop will execute 0 times and
+                    // removing the whole branch
+                    unsafe { asm!("nop"); }
                     while !v
                         .iter()
                         .map(|x| finished_jobs.read().unwrap().contains(x))
