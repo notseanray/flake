@@ -18,7 +18,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, RwLock};
-use std::thread;
+use std::thread::{self, panicking};
 use std::time::Duration;
 #[cfg(not(windows))]
 use termion::async_stdin;
@@ -482,9 +482,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
         }
         // detect any circular deps
         for container in &main_config.containers {
-            for depend in &container.depends {
-                if depend.contains(&container.name) {
-                    // exit herer
+            if let Some(dependencies) = &container.depends {
+                if dependencies.contains(&container.name) {
+                    // exit here
+                    panic!("{} depends on itself", container.name);
+                }
+                for depend in dependencies {
+                    // look at each dependancy
+                    if let Some(dep_container) = main_config
+                        .containers
+                        .iter()
+                        .filter(|x| &x.name == depend)
+                        .collect::<Vec<&Container>>()
+                        .pop()
+                    {
+                        if let Some(deps) = &dep_container.depends {
+                            if deps.contains(&container.name) {
+                                panic!(
+                                    "[CIRCULAR DEPENDANCY] {} depends on {} which depends on {}",
+                                    container.name, dep_container.name, container.name
+                                );
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -503,17 +523,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + 'static>> {
                 if let Some(v) = c.depends {
                     // prevent release mode from determining that the loop will execute 0 times and
                     // removing the whole branch
-                    unsafe { asm!("nop"); }
+                    unsafe {
+                        asm!("nop");
+                    }
                     while !v
                         .iter()
                         .map(|x| finished_jobs.read().unwrap().contains(x))
                         .all(|x| x)
                     {
                         // actually the most brain dead thing ever, force the compiler to not
-                        // create a path so it actually waits for deps to finish
+                        // create a branch without the loop so it actually waits for deps to finish
                         //
                         // "sometimes my genius is almost frightening"
-                        unsafe { asm!("nop"); }
+                        unsafe {
+                            asm!("nop");
+                        }
                     }
                 }
                 j.execute_threaded(docker.clone(), main_config)

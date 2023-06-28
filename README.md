@@ -4,8 +4,8 @@
 * cypress for frontend testing
 * full network tracing
 * fully reproducable via docker
-* fast & parallel where possible to reduce cost
-* randomized tests
+* fast & parallel where possible to reduce runtime
+* randomized tests to catch new bugs
 * json formatted logging to easily sort through
 
 ##### notes
@@ -17,3 +17,11 @@ to confirm this you can run `sudo lsof -i -P | grep LISTEN | grep :5000` to see 
 ##### quick reference links for future use
 * https://www.mongodb.com/docs/database-tools/mongoexport/
 * https://docs.docker.com/engine/reference/commandline/network_inspect/
+* https://docs.python.org/3/library/unittest.mock.html
+
+##### additional requirements to emulate
+* potentially AWS Amplify
+* SES
+* LaunchDarkly feature flags - maybe use staging
+* s3
+* lambda
